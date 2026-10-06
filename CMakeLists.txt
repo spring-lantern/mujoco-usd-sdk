@@ -21,6 +21,12 @@ set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 set(MUJOCO_ENABLE_LTO OFF CACHE BOOL "" FORCE)
 set(CMAKE_INTERPROCEDURAL_OPTIMIZATION OFF)
 add_subdirectory(third_party/mujoco EXCLUDE_FROM_ALL)
+# GCC 11 reports conditional-output initialization warnings in upstream collision code.
+# Preserve the diagnostics, but do not promote this warning to an error for the SDK.
+# No changes to the upstream implementation or the application's warning policy.
+if(CMAKE_C_COMPILER_ID STREQUAL "GNU" AND CMAKE_C_COMPILER_VERSION VERSION_LESS 12)
+  target_compile_options(mujoco PRIVATE "$<$<COMPILE_LANGUAGE:C>:-Wno-error=uninitialized>")
+endif()
 # 3.15.0 的 USD 源码使用 third_party/mujoco/... 形式的包含路径，
 # 且上游插件 CMake 遗漏 newton_tokens.cc；在集成层补齐，不修改子模块。
 target_include_directories(usd_decoder_plugin PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")

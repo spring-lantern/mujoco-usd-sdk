@@ -9,6 +9,8 @@ import platform
 import shutil
 import subprocess
 import tarfile
+import re
+import shlex
 
 
 def run(*args):
@@ -33,7 +35,10 @@ def main():
     patchelf = shutil.which('patchelf')
     if not patchelf:
         raise SystemExit('SDK packaging requires patchelf (sudo apt install patchelf).')
-    os_info = platform.freedesktop_os_release()
+    os_info = dict(line.split('=', 1) for line in Path('/etc/os-release').read_text().splitlines()
+                   if '=' in line and not line.startswith('#'))
+    os_info = {key: shlex.split(value)[0] for key, value in os_info.items() if value}
+    compiler = os.environ.get('CXX', 'c++')
     name = f'mujoco-3.15.0-usd-25.11-{os_info["ID"]}{os_info["VERSION_ID"]}-{platform.machine()}-r1'
     out = args.output.resolve() / name
     if out.exists():
@@ -55,6 +60,12 @@ def main():
     shutil.copy2(engine / 'lib/libglfw3.a', out / 'lib/libglfw3.a')
     copytree(usd / 'lib/usd', out / 'lib/usd')
     copytree(engine / 'lib/mujoco-usd-resources', out / 'lib/mujoco-usd-resources')
+    # Build-machine C++ runtimes use the same old glibc baseline as the SDK.
+    for soname in ('libstdc++.so.6', 'libgcc_s.so.1'):
+        runtime = Path(run(compiler, '-print-file-name=' + soname)).resolve()
+        if not runtime.is_file():
+            raise RuntimeError('Cannot locate compiler runtime: ' + soname)
+        shutil.copy2(runtime, out / 'lib' / soname)
     # Every shared object resolves its own sibling dependencies, independent of the app.
     for library in (out / 'lib').glob('*.so*'):
         if library.read_bytes()[:4] != b'\x7fELF':
@@ -87,15 +98,31 @@ def main():
                     target = licenses / source.name / item.name
                     target.parent.mkdir(parents=True, exist_ok=True)
                     shutil.copy2(item, target)
+    runtime_licenses = licenses / 'compiler-runtime'
+    runtime_licenses.mkdir(parents=True)
+    for package in ('libstdc++6', 'libgcc-s1', 'gcc-11-base'):
+        notice = Path('/usr/share/doc') / package / 'copyright'
+        if notice.exists():
+            shutil.copy2(notice, runtime_licenses / (package + '-copyright'))
+    glibc_versions = set()
+    for library in (out / 'lib').glob('*.so*'):
+        if library.read_bytes()[:4] == b'\x7fELF':
+            glibc_versions.update(re.findall(r'GLIBC_(\d+\.\d+(?:\.\d+)?)', run('readelf', '--version-info', library)))
+    required_glibc = max(glibc_versions, key=lambda v: tuple(map(int, v.split('.'))))
+    if os_info['VERSION_ID'] == '20.04' and tuple(map(int, required_glibc.split('.'))) > (2, 31):
+        raise RuntimeError('SDK exceeds glibc 2.31 baseline: ' + required_glibc)
     metadata = {
         'name': name, 'mujoco': '3.15.0', 'openusd': '25.11',
         'mujoco_commit': run('git', '-C', root / 'third_party/mujoco', 'rev-parse', 'HEAD'),
         'openusd_commit': run('git', '-C', root / 'third_party/openusd', 'rev-parse', 'HEAD'),
         'platform': os_info['PRETTY_NAME'], 'architecture': platform.machine(), 'cpu_requirement': 'AVX', 'lto': False,
-        'compiler': run('c++', '--version').splitlines()[0],
+        'compiler': run(compiler, '--version').splitlines()[0],
+        'required_glibc': required_glibc,
+        'bundled_runtime': ['libstdc++.so.6', 'libgcc_s.so.1'],
         'libc': run('getconf', 'GNU_LIBC_VERSION'),
+        'runtime_packages': run('dpkg-query', '-W', '-f=${Package}=${Version}\n', 'libstdc++6', 'libgcc-s1').splitlines(),
         'features': ['USD decoder', 'official simulate UI', 'GLFW X11', 'no Python runtime'],
-        'system_runtime': ['glibc', 'libstdc++', 'libgcc', 'X11/GL libraries and graphics driver'],
+        'system_runtime': ['glibc', 'X11/GL libraries and graphics driver'],
         'dependency_commits': {p.name: run('git', '-C', p, 'rev-parse', 'HEAD')
                                for p in (engine / '_deps').glob('*-src') if (p / '.git').exists()},
     }
@@ -106,8 +133,9 @@ Self-built SDK, not an official binary release. See VERSION.json for platform an
 MuJoCo/OpenUSD licenses and bundled dependency notices are under licenses/.
 Keep the complete directory together; libraries and USD resources use relative paths.
 Use find_package(SwarmMuJoCoSDK CONFIG REQUIRED) with this directory in CMAKE_PREFIX_PATH.
-System compiler, CMake, C/C++ runtime and graphics driver are not bundled.
-This build targets Ubuntu 24.04 x86_64 with AVX; Ubuntu 20.04/22.04 compatibility is not claimed.
+The compiler C++ runtimes are bundled; glibc and graphics drivers come from the host.
+See VERSION.json for the build baseline; OS compatibility is documented by validation results.
+Linux x86_64 with AVX is required.
 ''')
     # Check dependencies in the completed package, with no LD_LIBRARY_PATH override.
     env = dict(os.environ)
@@ -116,7 +144,8 @@ This build targets Ubuntu 24.04 x86_64 with AVX; Ubuntu 20.04/22.04 compatibilit
         if library.read_bytes()[:4] != b'\x7fELF':
             continue  # TBB also supplies text linker scripts.
         result = subprocess.check_output(['ldd', str(library)], env=env, text=True)
-        if 'not found' in result or '/home/' in result.replace(str(out), ''):
+        if 'not found' in result or any(not path.startswith((str(out) + '/', '/lib/', '/lib64/', '/usr/lib/'))
+                                      for path in re.findall(r'=> (/\S+)', result)):
             raise RuntimeError(f'Unresolved or nonportable dependencies in {library}:\n{result}')
     entries = []
     for file in sorted(out.rglob('*')):
