@@ -8,6 +8,8 @@ if(NOT CMAKE_BUILD_TYPE)
   set(CMAKE_BUILD_TYPE Release CACHE STRING "Build type" FORCE)
 endif()
 set(MUJOCO_WITH_USD ON CACHE BOOL "USD is required by this project" FORCE)
+set(MUJOCO_USE_FILAMENT ON CACHE BOOL "Filament renders the simulation scene" FORCE)
+set(MUJOCO_USE_FILAMENT_MJR_COMPAT OFF CACHE BOOL "Retain official 2D UI functions" FORCE)
 set(MUJOCO_BUILD_TESTS OFF CACHE BOOL "" FORCE)
 set(MUJOCO_TEST_PYTHON_UTIL OFF CACHE BOOL "" FORCE)
 set(MUJOCO_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
@@ -17,25 +19,10 @@ set(SIMULATE_BUILD_EXECUTABLE OFF CACHE BOOL "" FORCE)
 set(GLFW_BUILD_WAYLAND OFF CACHE BOOL "" FORCE)
 set(GLFW_BUILD_X11 ON CACHE BOOL "" FORCE)
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)
+# Share the native OpenUSD libstdc++ ABI; do not introduce a second C++ runtime.
+set(USE_STATIC_LIBCXX OFF CACHE BOOL "Use the SDK libstdc++ runtime" FORCE)
 # SDK static libraries must contain ordinary objects, not compiler-specific LTO bytecode.
 set(MUJOCO_ENABLE_LTO OFF CACHE BOOL "" FORCE)
 set(CMAKE_INTERPROCEDURAL_OPTIMIZATION OFF)
 add_subdirectory(third_party/mujoco EXCLUDE_FROM_ALL)
-# GCC 11 reports conditional-output initialization warnings in upstream collision code.
-# Preserve the diagnostics, but do not promote this warning to an error for the SDK.
-# No changes to the upstream implementation or the application's warning policy.
-if(CMAKE_C_COMPILER_ID STREQUAL "GNU" AND CMAKE_C_COMPILER_VERSION VERSION_LESS 12)
-  target_compile_options(mujoco PRIVATE "$<$<COMPILE_LANGUAGE:C>:-Wno-error=uninitialized>")
-endif()
-# 3.15.0 的 USD 源码使用 third_party/mujoco/... 形式的包含路径，
-# 且上游插件 CMake 遗漏 newton_tokens.cc；在集成层补齐，不修改子模块。
-target_include_directories(usd_decoder_plugin PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
-target_sources(usd_decoder_plugin PRIVATE
-  "${CMAKE_CURRENT_SOURCE_DIR}/third_party/mujoco/plugin/usd_decoder/newton_tokens.cc")
-# 官方仅在 install 阶段复制这个 schema；本项目从 build 目录直接运行。
-configure_file(
-  "${CMAKE_CURRENT_SOURCE_DIR}/third_party/mujoco/src/experimental/usd/mjcPhysics/generatedSchema.usda"
-  "${CMAKE_BINARY_DIR}/${CMAKE_INSTALL_LIBDIR}/mujoco-usd-resources/mjcPhysics/generatedSchema.usda"
-  COPYONLY)
-
-add_custom_target(sdk_libraries ALL DEPENDS mujoco libmujoco_simulate glfw usd_decoder_plugin usdMjcf)
+add_custom_target(sdk_libraries ALL DEPENDS mujoco libmujoco_simulate glfw usd_decoder_plugin usdMjcf mujoco_filament)

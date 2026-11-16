@@ -1,0 +1,512 @@
+diff --git a/cmake/third_party_deps/dear_imgui.cmake b/cmake/third_party_deps/dear_imgui.cmake
+index 334401c93..35e23c127 100644
+--- a/cmake/third_party_deps/dear_imgui.cmake
++++ b/cmake/third_party_deps/dear_imgui.cmake
+@@ -24,5 +24,5 @@ fetchpackage(
+     PACKAGE_NAME  dear_imgui
+     GIT_REPO      https://github.com/ocornut/imgui.git
+     GIT_TAG       ${MUJOCO_DEP_VERSION_dear_imgui}
+-    CUSTOM_CMAKE  "${CMAKE_SOURCE_DIR}/cmake/third_party_deps/dear_imgui/CMakeLists.txt"
++    CUSTOM_CMAKE  "${mujoco_SOURCE_DIR}/cmake/third_party_deps/dear_imgui/CMakeLists.txt"
+ )
+diff --git a/plugin/usd_decoder/CMakeLists.txt b/plugin/usd_decoder/CMakeLists.txt
+index cd335568b..e35385c54 100644
+--- a/plugin/usd_decoder/CMakeLists.txt
++++ b/plugin/usd_decoder/CMakeLists.txt
+@@ -22,7 +22,9 @@ else()
+   set(CMAKE_INSTALL_RPATH "${CMAKE_INSTALL_LIBDIR}")
+ endif()
+ if(UNIX AND NOT APPLE)
+-  add_compile_definitions(_GLIBCXX_USE_CXX11_ABI=0 ARCH_HAS_GNU_STL_EXTENSIONS)
++  # Native OpenUSD is built with the compiler default C++ string ABI.
++  # Respect pxr target definitions instead of forcing the Python wheel ABI.
++  add_compile_definitions(ARCH_HAS_GNU_STL_EXTENSIONS)
+   string(REPLACE "-stdlib=libc++" "" CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS}")
+   foreach(
+     _flag
+diff --git a/simulate/CMakeLists.txt b/simulate/CMakeLists.txt
+index 538c58377..44ec90c08 100644
+--- a/simulate/CMakeLists.txt
++++ b/simulate/CMakeLists.txt
+@@ -120,7 +120,8 @@ target_include_directories(libmujoco_simulate
+         $<TARGET_PROPERTY:lodepng,INTERFACE_INCLUDE_DIRECTORIES>
+ )
+ target_compile_options(libmujoco_simulate PRIVATE ${MUJOCO_SIMULATE_COMPILE_OPTIONS})
+-target_link_libraries(libmujoco_simulate PUBLIC mujoco::mujoco)
++target_link_libraries(libmujoco_simulate PUBLIC mujoco::mujoco mujoco::filament ${CMAKE_DL_LIBS})
++target_compile_features(libmujoco_simulate PRIVATE cxx_std_20)
+ target_link_options(libmujoco_simulate PRIVATE ${MUJOCO_SIMULATE_LINK_OPTIONS})
+ 
+ if(APPLE)
+diff --git a/simulate/simulate.cc b/simulate/simulate.cc
+index 5e3e3e8a4..01af164c9 100644
+--- a/simulate/simulate.cc
++++ b/simulate/simulate.cc
+@@ -20,6 +20,9 @@
+ #include <climits>
+ #include <cstdio>
+ #include <cstring>
++#include <dlfcn.h>
++#include <filesystem>
++#include <fstream>
+ #include <memory>
+ #include <optional>
+ #include <ratio>
+@@ -35,6 +38,14 @@
+ #include <mujoco/mujoco.h>
+ #include "platform_ui_adapter.h"
+ #include "array_safety.h"
++// Filament 的官方 math 向量使用匿名 struct；仅在导入这些头时允许该扩展。
++#pragma GCC diagnostic push
++#pragma GCC diagnostic ignored "-Wpedantic"
++#include "render/filament/support/model_resources.h"
++#include "render/filament/support/model_renderables.h"
++#include "render/filament/support/model_lights.h"
++#include "render/filament/support/model_decorations.h"
++#pragma GCC diagnostic pop
+ 
+ // When launched via an App Bundle on macOS, the working directory is the path to the App Bundle's
+ // resource directory. This causes files to be saved into the bundle, which is not the desired
+@@ -88,6 +99,43 @@ inline void Copy(T& dst, const T& src) {
+   }
+ }
+ 
++/** @brief 为 Filament 注册随当前 MuJoCo SDK 搬迁的只读 shader/IBL 资源。
++ * 仅在创建 GPU context 前由主线程调用；已注册同前缀时沿用官方进程级资源表。
++ */
++void RegisterFilamentResources() {
++  if (mjp_findProvider("filament:") != nullptr) return;
++
++  // 以实际加载的引擎动态库定位 SDK，既不依赖 CWD，也不把构建机路径写入发布包。
++  mjpResourceProvider provider;
++  mjp_defaultProvider(&provider);
++  provider.prefix = "filament";
++  provider.open = [](mjResource* resource) {
++    Dl_info module{};
++    if (!dladdr(dlsym(RTLD_DEFAULT, "mj_version"), &module) || !module.dli_fname) return 0;
++    const auto path = std::filesystem::path(module.dli_fname).parent_path().parent_path() /
++                      "share/mujoco/filament" / (resource->name + std::strlen("filament:"));
++    std::ifstream file(path, std::ios::binary | std::ios::ate);
++    if (!file) return 0;
++    const auto length = file.tellg();
++    if (length <= 0 || length > INT_MAX) return 0;
++    auto bytes = std::make_unique<std::vector<char>>(static_cast<size_t>(length));
++    file.seekg(0);
++    if (!file.read(bytes->data(), length)) return 0;
++    resource->data = bytes.release();
++    return 1;
++  };
++  provider.read = [](mjResource* resource, const void** buffer) {
++    const auto& bytes = *static_cast<std::vector<char>*>(resource->data);
++    *buffer = bytes.data();
++    return static_cast<int>(bytes.size());
++  };
++  provider.close = [](mjResource* resource) {
++    delete static_cast<std::vector<char>*>(resource->data);
++    resource->data = nullptr;
++  };
++  if (mjp_registerProvider(&provider) < 0) mju_error("Could not register Filament SDK resources");
++}
++
+ //------------------------------------------- global -----------------------------------------------
+ 
+ const double zoom_increment = 0.02;  // ratio of one click-wheel zoom increment to vertical extent
+@@ -892,7 +940,10 @@ void MakePhysicsSection(mj::Simulate* sim) {
+ }
+ 
+ 
+-// make rendering section of UI
++/** @brief 重建共享的相机、标签与 Filament 效果控件，不改变控件索引。
++ * @param sim 借用的非空查看器，调用期间持有其 mtx。
++ * @param m 借用的非空已编译模型，供枚举相机及可视参数。
++ */
+ void MakeRenderingSection(mj::Simulate* sim, const mjModel* m) {
+   mjuiDef defRendering[] = {
+       {mjITEM_SECTION, "Rendering", mjPRESERVE, nullptr, "AR"},
+@@ -911,7 +962,7 @@ void MakeRenderingSection(mj::Simulate* sim, const mjModel* m) {
+       {mjITEM_END}
+   };
+   mjuiDef defOpenGL[] = {
+-      {mjITEM_SEPARATOR, "OpenGL Effects", 1},
++      {mjITEM_SEPARATOR, "Filament Effects", 1},
+       {mjITEM_END}
+   };
+ 
+@@ -997,6 +1048,8 @@ void MakeRenderingSection(mj::Simulate* sim, const mjModel* m) {
+   // add rendering flags
+   mjui_add(&sim->ui0, defOpenGL);
+   for (int i = 0; i < mjNRNDFLAG; i++) {
++    // mjrf 不提供这三个 classic 逐帧效果；保留控件位置但不允许无效操作。
++    defFlag[0].state = (i == mjRND_ADDITIVE || i == mjRND_FOG || i == mjRND_CULL_FACE) ? 0 : 2;
+     // set name
+     mju::strcpy_arr(defFlag[0].name, mjRNDSTRING[i][0]);
+ 
+@@ -2118,6 +2171,153 @@ Simulate::Simulate(std::unique_ptr<PlatformUIAdapter> platform_ui,
+ }
+ 
+ 
++Simulate::~Simulate() {
++  FreeFilament();
++}
++
++void Simulate::FreeFilament() {
++  // 销毁顺序保证材质和网格所引用的 scene/context 仍然有效。
++  filament_user_meshes_.clear();
++  filament_user_decor_.clear();
++  filament_decorations_.reset();
++  filament_renderables_.reset();
++  filament_lights_.reset();
++  filament_resources_.reset();
++  if (filament_target_) mjrf_destroyRenderTarget(filament_target_);
++  if (filament_scene_) mjrf_destroyScene(filament_scene_);
++  if (filament_context_) mjrf_destroyContext(filament_context_);
++  filament_target_ = nullptr;
++  filament_scene_ = nullptr;
++  filament_context_ = nullptr;
++  filament_pixels_.clear();
++  filament_labels_.clear();
++}
++
++void Simulate::InitFilament(const mjModel* model) {
++  RegisterFilamentResources();
++
++  // Vulkan 离屏目标与 GLFW 的二维 OpenGL 上下文分离，避免隐式切换当前上下文。
++  mjrfContextConfig context_config;
++  mjrf_defaultContextConfig(&context_config);
++  context_config.graphics_api = mjGRAPHICS_API_VULKAN;
++  filament_context_ = mjrf_createContext(&context_config);
++  mjrfSceneParams scene_params;
++  mjrf_defaultSceneParams(&scene_params);
++  filament_scene_ = mjrf_createScene(filament_context_, &scene_params);
++  mjrf_configureSceneFromModel(filament_scene_, model);
++
++  // 复用官方缓存管理器；每帧仅同步位姿，不重建树林和建筑的网格或材质。
++  filament_resources_ = std::make_unique<ModelResources>(model, filament_context_);
++  filament_renderables_ = std::make_unique<ModelRenderables>(filament_scene_, filament_resources_.get());
++  filament_lights_ = std::make_unique<ModelLights>(filament_scene_, filament_resources_.get());
++  filament_decorations_ = std::make_unique<ModelDecorations>(filament_context_, filament_scene_, model, kMaxGeom);
++  mjrfRenderTargetConfig target_config;
++  mjrf_defaultRenderTargetConfig(&target_config);
++  target_config.color_format = mjPIXEL_FORMAT_RGB8;
++  target_config.depth_format = mjPIXEL_FORMAT_DEPTH32F;
++  filament_target_ = mjrf_createRenderTarget(filament_context_, &target_config);
++}
++
++void Simulate::SyncFilament(const mjModel* model, mjData* data) {
++  if (!filament_context_ || !model || !data) return;
++
++  // 上帧额外显示的隐藏 mesh 不属于默认模型可见组，先移除再同步当前可见性。
++  for (auto* renderable : filament_user_meshes_) mjrf_removeSceneRenderable(filament_scene_, renderable);
++  filament_user_meshes_.clear();
++  filament_user_decor_.clear();
++  filament_lights_->Update(data);
++  filament_renderables_->SetOptions(opt);
++  if (pert.select > 0) filament_renderables_->MarkAsSelected(mjOBJ_BODY, pert.select);
++  else if (pert.flexselect >= 0) filament_renderables_->MarkAsSelected(mjOBJ_FLEX, pert.flexselect);
++  else if (pert.skinselect >= 0) filament_renderables_->MarkAsSelected(mjOBJ_SKIN, pert.skinselect);
++  else filament_renderables_->MarkAsSelected(mjOBJ_UNKNOWN, -1);
++  filament_renderables_->Update(data);
++
++  // 桨叶来自隐藏的 group 3 模型 mesh；只覆盖显示位姿，不修改 mjData 或动力学。
++  for (const auto& geom : user_scn_geoms_) {
++    if (geom.objtype == mjOBJ_GEOM && geom.objid >= 0 && geom.objid < model->ngeom &&
++        !opt.geomgroup[model->geom_group[geom.objid]]) {
++      if (auto* renderable = filament_renderables_->GetRenderable(mjOBJ_GEOM, geom.objid)) {
++        mjrf_setRenderablePose(renderable, geom.pos, geom.mat);
++        mjrf_addSceneRenderable(filament_scene_, renderable);
++        filament_user_meshes_.push_back(renderable);
++      }
++    } else {
++      filament_user_decor_.push_back(geom);
++    }
++  }
++
++  // 坐标轴、接触点等非模型装饰使用官方动态装饰路径；相机仍由原查看器维护。
++  filament_labels_.clear();
++  const mjrRect viewport = uistate.rect[3];
++  if (viewport.width > 0 && viewport.height > 0) {
++    filament_decorations_->Update(data, &opt, &pert, &cam, viewport,
++        [this](const char* text, float x, float y, float z) {
++          if (z >= -1 && z <= 1) filament_labels_.emplace_back(text, .5f * (x + 1), .5f * (y + 1));
++        }, filament_user_decor_);
++  }
++}
++
++void Simulate::RenderFilament(mjrRect viewport) {
++  if (!filament_context_ || viewport.width <= 0 || viewport.height <= 0) return;
++
++  // 目标尺寸跟随窗口；像素缓冲在尺寸不变时复用，仿真线程在 GPU 绘制期间继续推进。
++  mjrf_resizeRenderTarget(filament_target_, viewport.width, viewport.height);
++  filament_pixels_.resize(static_cast<size_t>(viewport.width) * viewport.height * 3);
++  mjrfRenderRequest request;
++  mjrf_defaultRenderRequest(&request);
++  request.scene = filament_scene_;
++  request.target = filament_target_;
++  request.viewport = {0, 0, viewport.width, viewport.height};
++  request.camera = mjv_averageCamera(scn.camera, scn.camera + 1);
++  request.shadows = scn.flags[mjRND_SHADOW];
++  request.reflections = scn.flags[mjRND_REFLECTION];
++  request.skybox = scn.flags[mjRND_SKYBOX];
++  request.haze = scn.flags[mjRND_HAZE];
++  request.post_processing = scn.flags[mjRND_POST_PROCESSING];
++  request.headlight_intensity = filament_lights_->GetHeadlightIntensity();
++  {
++    // passive 模型的可视参数会在 Sync 中修改；仅拷贝参数时持锁，GPU 工作不持锁。
++    const MutexLock lock(mtx);
++    const auto& headlight = filament_resources_->GetModel()->vis.headlight;
++    request.headlight = headlight.active;
++    std::copy_n(headlight.diffuse, 3, request.headlight_color);
++  }
++  if (scn.flags[mjRND_SEGMENT]) {
++    request.draw_mode = scn.flags[mjRND_IDCOLOR] ? mjDRAW_MODE_SEGMENTATION_BY_ID : mjDRAW_MODE_SEGMENTATION_BY_COLOR;
++  } else if (scn.flags[mjRND_DEPTH]) {
++    request.draw_mode = mjDRAW_MODE_DEPTH;
++  } else if (scn.flags[mjRND_WIREFRAME]) {
++    request.draw_mode = mjDRAW_MODE_WIREFRAME;
++  } else if (opt.flags[mjVIS_ISLAND]) {
++    request.draw_mode = mjDRAW_MODE_ISLANDS;
++  }
++
++  // 官方 mjrf 没有导出共享 GL 纹理的接口，等待这一帧读回完成后再交给二维合成。
++  mjrfReadRequest read;
++  mjrf_defaultReadRequest(&read);
++  read.target = filament_target_;
++  read.output = filament_pixels_.data();
++  read.num_bytes = filament_pixels_.size();
++  const auto frame = mjrf_render(filament_context_, &request, 1, &read, 1);
++  mjrf_waitForFrame(filament_context_, frame);
++
++  // Filament 的读回以图像顶行为起点，而 glDrawPixels 从底行开始；仅转换像素行序。
++  const size_t stride = static_cast<size_t>(viewport.width) * 3;
++  for (int row = 0; row < viewport.height / 2; ++row) {
++    auto top = filament_pixels_.begin() + row * stride;
++    auto bottom = filament_pixels_.begin() + (viewport.height - row - 1) * stride;
++    std::swap_ranges(top, top + stride, bottom);
++  }
++  mjr_restoreBuffer(&platform_ui->mjr_context());
++  mjr_rectangle(viewport, 0, 0, 0, 1);
++  mjr_drawPixels(filament_pixels_.data(), nullptr, viewport, &platform_ui->mjr_context());
++  for (const auto& [text, x, y] : filament_labels_) {
++    mjr_text(mjFONT_NORMAL, text.c_str(), &platform_ui->mjr_context(), x, y, 1, 1, 1);
++  }
++}
++
++
+ //------------------------- Synchronize render and physics threads ---------------------------------
+ 
+ // operations which require holding the mutex, prevents racing with physics thread
+@@ -2472,6 +2672,8 @@ void Simulate::LoadMessageClear(void) {
+ 
+ //------------------------------------- load mjb or xml model --------------------------------------
+ void Simulate::LoadOnRenderThread() {
++  // 旧模型的资源必须先释放，新模型就绪后再创建缓存。
++  FreeFilament();
+   this->m_ = this->mnew_;
+   this->d_ = this->dnew_;
+ 
+@@ -2593,7 +2795,8 @@ void Simulate::LoadOnRenderThread() {
+   // re-create scene
+   mjv_makeScene(this->m_, &this->scn, kMaxGeom);
+ 
+-  this->platform_ui->RefreshMjrContext(this->m_, 50 * (this->font + 1));
++  // classic context 仅用于二维字体和侧栏，不重复上传三维模型。
++  this->platform_ui->RefreshMjrContext(nullptr, 50 * (this->font + 1));
+   UiModify(&this->ui0, &this->uistate, &this->platform_ui->mjr_context());
+   UiModify(&this->ui1, &this->uistate, &this->platform_ui->mjr_context());
+ 
+@@ -2635,6 +2838,8 @@ void Simulate::LoadOnRenderThread() {
+     d_passive_ = mj_copyData(nullptr, m_passive_, d_);
+   }
+ 
++  InitFilament(is_passive_ ? m_passive_ : m_);
++
+   // set window title to model name
+   if (this->m_->names) {
+     char title[200] = "MuJoCo : ";
+@@ -2856,7 +3061,7 @@ void Simulate::Render() {
+   }
+ 
+   // render scene
+-  mjr_render(rect, &this->scn, &this->platform_ui->mjr_context());
++  RenderFilament(rect);
+ 
+   // show last loading error
+   if (this->load_error[0]) {
+@@ -3109,24 +3314,21 @@ void Simulate::RenderLoop() {
+       // poll and handle events
+       this->platform_ui->PollEvents();
+ 
+-      // upload assets if requested
+-      bool upload_notify = false;
+-      if (hfield_upload_ != -1) {
+-        mjr_uploadHField(m_, &platform_ui->mjr_context(), hfield_upload_);
+-        hfield_upload_ = -1;
+-        upload_notify  = true;
+-      }
+-      if (mesh_upload_ != -1) {
+-        mjr_uploadMesh(m_, &platform_ui->mjr_context(), mesh_upload_);
+-        mesh_upload_  = -1;
+-        upload_notify = true;
+-      }
+-      if (texture_upload_ != -1) {
+-        mjr_uploadTexture(m_, &platform_ui->mjr_context(), texture_upload_);
+-        texture_upload_ = -1;
+-        upload_notify   = true;
++      // 显式修改 mesh/texture/heightfield 时重建引用它们的 GPU 缓存。
++      // passive 引擎使用自己的可视模型，不能把 m_ 传给绑定 m_passive_ 的资源管理器。
++      if (hfield_upload_ != -1 || mesh_upload_ != -1 || texture_upload_ != -1) {
++        if (hfield_upload_ != -1 && (hfield_upload_ < 0 || hfield_upload_ >= m_->nhfield))
++          mju_error("Invalid height field upload index");
++        if (mesh_upload_ != -1 && (mesh_upload_ < 0 || mesh_upload_ >= m_->nmesh))
++          mju_error("Invalid mesh upload index");
++        if (texture_upload_ != -1 && (texture_upload_ < 0 || texture_upload_ >= m_->ntex))
++          mju_error("Invalid texture upload index");
++        FreeFilament();
++        if (is_passive_) mj_copyModel(m_passive_, m_);
++        InitFilament(is_passive_ ? m_passive_ : m_);
++        hfield_upload_ = mesh_upload_ = texture_upload_ = -1;
++        cond_upload_.notify_all();
+       }
+-      if (upload_notify) { cond_upload_.notify_all(); }
+ 
+       // update scene, doing a full sync if in fully managed mode
+       if (!is_passive_) {
+@@ -3158,6 +3360,8 @@ void Simulate::RenderLoop() {
+                     ngeom * sizeof(mjvGeom));
+         this->scn.ngeom += ngeom;
+       }
++      // 使用同一份持锁快照同步 GPU 对象，离屏渲染与读回在锁外执行。
++      SyncFilament(is_passive_ ? m_passive_ : m_, is_passive_ ? d_passive_ : d_);
+     }  // MutexLock (unblocks simulation thread)
+ 
+     // render while simulation is running
+@@ -3175,6 +3379,7 @@ void Simulate::RenderLoop() {
+   }
+ 
+   const MutexLock lock(this->mtx);
++  FreeFilament();
+   mjv_freeScene(&this->scn);
+   if (is_passive_) {
+     mj_deleteData(d_passive_);
+diff --git a/simulate/simulate.h b/simulate/simulate.h
+index 8b5ae73cb..2a25f45c7 100644
+--- a/simulate/simulate.h
++++ b/simulate/simulate.h
+@@ -28,10 +28,15 @@
+ #include <vector>
+ 
+ #include <mujoco/mjui.h>
++#include <mujoco/mjrfilament.h>
+ #include <mujoco/mujoco.h>
+ #include "platform_ui_adapter.h"
+ 
+ namespace mujoco {
++class ModelResources;
++class ModelRenderables;
++class ModelLights;
++class ModelDecorations;
+ 
+ // The viewer itself doesn't require a reentrant mutex, however we use it in
+ // order to provide a Python sync API that doesn't require separate locking
+@@ -56,6 +61,28 @@ class Simulate {
+            mjvPerturb*                        pert,
+            bool                               is_passive);
+ 
++  /** @brief 在创建查看器的主线程释放 Filament 资源；模型必须存活到 RenderLoop 返回。 */
++  ~Simulate();
++
++  /** @brief 释放当前模型的 GPU 资源；只能在渲染线程且没有在途帧时调用，可重复调用。 */
++  void FreeFilament();
++
++  /** @brief 为已加载模型创建唯一三维渲染器，静态网格只上传一次。
++   * @param model 借用的非空可视模型；必须存活到 FreeFilament，使用 MuJoCo world 坐标和米。
++   */
++  void InitFilament(const mjModel* model);
++
++  /** @brief 持有 mtx 时同步模型位姿、可视选项和 user_scn 桨叶，不推进物理。
++   * @param model 借用的非空可视模型，必须与 InitFilament 的模型一致。
++   * @param data 借用的该模型可视状态，只在调用期间读取，时间轴为仿真时间。
++   */
++  void SyncFilament(const mjModel* model, mjData* data);
++
++  /** @brief 主线程绘制 Filament 三维帧并合成至原生二维界面，不调用 classic 三维渲染。
++   * @param viewport 窗口像素坐标的三维视口；宽高非正时不渲染。
++   */
++  void RenderFilament(mjrRect viewport);
++
+   // Synchronize state with UI inputs, and update visualization.  If state_only
+   // is false mjData and mjModel will be updated, otherwise only the subset of
+   // mjData corresponding to mjSTATE_INTEGRATION will be synced.
+@@ -78,13 +105,13 @@ class Simulate {
+   void LoadMessageClear(void);
+ 
+   // functions below are used by the renderthread
+-  // load mjb or xml model that has been requested by load()
++  /** @brief 持有 mtx 的主线程切换模型，先释放旧模型渲染资源再建立新资源。 */
+   void LoadOnRenderThread();
+ 
+-  // render the ui to the window
++  /** @brief 主线程合成唯一 Filament 三维帧、官方侧栏和文字；不推进物理。 */
+   void Render();
+ 
+-  // loop to render the UI (must be called from main thread because of MacOS)
++  /** @brief 主线程处理窗口并同步渲染；退出时在模型销毁前释放所有 GPU 资源。 */
+   void RenderLoop();
+ 
+   // add state to history buffer
+@@ -145,6 +172,20 @@ class Simulate {
+ 
+   std::vector<mjvGeom> user_scn_geoms_;
+ 
++  // 唯一三维渲染路径；依次释放依赖对象后才释放 scene/context。
++  mjrfContext* filament_context_ = nullptr;
++  mjrfScene* filament_scene_ = nullptr;
++  mjrfRenderTarget* filament_target_ = nullptr;
++  std::unique_ptr<ModelResources> filament_resources_;
++  std::unique_ptr<ModelRenderables> filament_renderables_;
++  std::unique_ptr<ModelLights> filament_lights_;
++  std::unique_ptr<ModelDecorations> filament_decorations_;
++  std::vector<mjrfRenderable*> filament_user_meshes_;
++  std::vector<mjvGeom> filament_user_decor_;
++  std::vector<unsigned char> filament_pixels_;
++  std::vector<std::tuple<std::string, float, float>> filament_labels_;
++
++
+   mjOption    mjopt_prev_;
+   mjVisual    mjvis_prev_;
+   mjStatistic mjstat_prev_;
+@@ -314,7 +355,7 @@ class Simulate {
+   std::vector<std::tuple<mjrRect, std::unique_ptr<unsigned char[]>>> user_images_;
+   std::vector<std::tuple<mjrRect, std::unique_ptr<unsigned char[]>>> user_images_new_;
+ 
+-  // OpenGL rendering and UI
++  // Filament 三维场景与 classic 二维 UI
+   int refresh_rate   = 60;
+   int window_pos[2]  = {0};
+   int window_size[2] = {0};
+diff --git a/src/experimental/usd/CMakeLists.txt b/src/experimental/usd/CMakeLists.txt
+index f9b63b871..2000120f3 100644
+--- a/src/experimental/usd/CMakeLists.txt
++++ b/src/experimental/usd/CMakeLists.txt
+@@ -39,15 +39,12 @@ set(DEFAULT_CXX_VISIBILITY_PROPS
+ )
+ 
+ if(UNIX AND NOT APPLE)
+-  # Prebuilt OpenUSD (and PyPI's manylinux2014 usd-core wheel) is built with GCC
+-  # against libstdc++ (_GLIBCXX_USE_CXX11_ABI=0 and ARCH_HAS_GNU_STL_EXTENSIONS
+-  # for TfHashMap/TfHashSet) on Linux, so strip any global -stdlib=libc++ /
+-  # -lc++ flags inherited from the root MuJoCo build.
+-  # Link -lstdc++ before OpenUSD and hide static libstdc++_nonshared.a symbols
+-  # so each library embeds its own hidden copy of symbols such as
+-  # _ZSt28__throw_bad_array_new_lengthv instead of binding to the build-time
+-  # libusd_ms.so.
+-  add_compile_definitions(_GLIBCXX_USE_CXX11_ABI=0 ARCH_HAS_GNU_STL_EXTENSIONS)
++  # Native OpenUSD and MuJoCo use the same libstdc++ runtime. Strip any
++  # globally inherited libc++ flags, but retain the C++ string ABI selected
++  # by the native pxr build instead of assuming a Python wheel's old ABI.
++  # Native OpenUSD is built with the compiler default C++ string ABI.
++  # Respect pxr target definitions instead of forcing the Python wheel ABI.
++  add_compile_definitions(ARCH_HAS_GNU_STL_EXTENSIONS)
+   list(PREPEND OPENUSD_CORE_LIBS -Wl,-lstdc++ -Wl,--exclude-libs,libstdc++_nonshared.a)
+   string(REPLACE "-stdlib=libc++" "" CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS}")
+   foreach(
